@@ -1,21 +1,14 @@
 {
-  "name": "obsidian-mcp-bridge",
+  "name": "obsidian-mcp-workspace",
+  "private": true,
+  "workspaces": [
+    "obsidian-mcp-bridge",
+    "mcp-shim"
+  ],
   "scripts": {
-    "test": "node --test"
+    "test": "npm test --workspaces --if-present"
   },
-  "version": "1.0.0",
-  "description": "HTTP bridge that makes obsidian-mcp accessible to remote MCP clients (Claude Code, Claude Desktop) with OAuth discovery and path-level access control",
-  "type": "module",
-  "main": "obsidian-mcp-bridge.mjs",
   "engines": {
     "node": ">=18"
-  },
-  "keywords": [
-    "mcp",
-    "obsidian",
-    "claude",
-    "bridge",
-    "oauth"
-  ],
-  "license": "MIT"
+  }
 }

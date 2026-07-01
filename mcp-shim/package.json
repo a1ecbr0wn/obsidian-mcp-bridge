@@ -1,0 +1,24 @@
+{
+  "name": "mcp-shim",
+  "version": "1.0.0",
+  "description": "Lightweight stdio↔HTTP shim for connecting Claude Desktop and other MCP clients to remote MCP servers",
+  "type": "module",
+  "main": "mcp-shim.mjs",
+  "bin": {
+    "mcp-shim": "./mcp-shim.mjs"
+  },
+  "files": [
+    "mcp-shim.mjs"
+  ],
+
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "claude",
+    "shim",
+    "stdio"
+  ],
+  "license": "MIT"
+}

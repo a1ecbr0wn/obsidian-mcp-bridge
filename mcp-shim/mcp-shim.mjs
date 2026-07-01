@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import https from "node:https";
 import { createInterface } from "node:readline";
 

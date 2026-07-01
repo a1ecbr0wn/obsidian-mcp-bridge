@@ -1,0 +1,28 @@
+{
+  "name": "obsidian-mcp-bridge",
+  "version": "1.0.0",
+  "description": "HTTP bridge that makes obsidian-mcp accessible to remote MCP clients (Claude Code, Claude Desktop) with OAuth discovery and path-level access control",
+  "type": "module",
+  "main": "obsidian-mcp-bridge.mjs",
+  "bin": {
+    "obsidian-mcp-bridge": "./obsidian-mcp-bridge.mjs"
+  },
+  "files": [
+    "obsidian-mcp-bridge.mjs",
+    "lib/"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "obsidian",
+    "claude",
+    "bridge",
+    "oauth"
+  ],
+  "license": "MIT"
+}

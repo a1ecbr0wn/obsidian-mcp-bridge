@@ -133,10 +133,11 @@ function spawnChild() {
 
   child.stdout.on('data', chunk => {
     if (child !== self) return; // stale listener from killed child, discard
-    console.log(`  ← child stdout: ${chunk.length} bytes, pending=${pending.size}`);
-    childBuf += chunk.toString();
-    if (childBuf.length > 10 * 1024 * 1024) {
-      console.error('childBuf overflow, restarting child');
+    const chunkStr = chunk.toString();
+    console.log(`  ← child stdout: ${chunk.length} bytes (buf=${childBuf.length + chunkStr.length}), pending=${pending.size}`);
+    childBuf += chunkStr;
+    if (childBuf.length > 10 * 1024 * 1024) { // obsidian-mcp messages can be large; 10MB prevents resource exhaustion
+      console.error(`childBuf overflow at ${childBuf.length} bytes (limit=10MB), restarting child`);
       childBuf = '';
       if (child && !child.killed) child.kill('SIGTERM');
       return;
@@ -466,9 +467,13 @@ async function route(req, res, url, sid) {
   req.setEncoding('utf8');
   let body = '';
   for await (const chunk of req) {
-    if (body.length + chunk.length > 1048576) { req.destroy(); res.writeHead(413); return res.end('request too large'); }
+    if (body.length + chunk.length > 10 * 1024 * 1024) { // raised from 1MB to accommodate large obsidian-mcp messages
+      console.error(`request body too large at ${body.length + chunk.length} bytes (limit=10MB)`);
+      req.destroy(); res.writeHead(413); return res.end('request too large');
+    }
     body += chunk;
   }
+  if (body.length > 10_000) console.log(`  → request body: ${body.length} bytes`);
 
   let msg;
   try { msg = JSON.parse(body); } catch {

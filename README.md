@@ -67,8 +67,13 @@ Obsidian vault (filesystem)
 
 ### Installation
 
-Copy `obsidian-mcp-bridge.mjs` to wherever you want to run it from, then set it
-up as a persistent service.
+Install dependencies and build the packages:
+
+```bash
+npm install
+```
+
+The `obsidian-mcp-bridge` package can then be run directly from the workspace, or you can copy the built files to wherever you want to run them from. Then set it up as a persistent service.
 
 ### systemd (Linux)
 
@@ -80,7 +85,7 @@ Description=Obsidian MCP Bridge
 After=network.target
 
 [Service]
-ExecStart=node /path/to/obsidian-mcp-bridge.mjs
+ExecStart=node /path/to/obsidian-mcp-bridge/obsidian-mcp-bridge/obsidian-mcp-bridge.mjs
 Environment=LISTEN_PORT=3002
 Environment=MCP_BASE_URL=https://your-hostname:4001
 Environment=VAULT=/path/to/your/obsidian/vault
@@ -115,7 +120,7 @@ Create `~/Library/LaunchAgents/com.obsidian-mcp-bridge.plist`:
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/node</string>
-    <string>/path/to/obsidian-mcp-bridge.mjs</string>
+    <string>/path/to/obsidian-mcp-bridge/obsidian-mcp-bridge/obsidian-mcp-bridge.mjs</string>
   </array>
 
   <key>EnvironmentVariables</key>
@@ -333,7 +338,7 @@ Restart Claude Desktop after saving.
   "mcpServers": {
     "obsidian": {
       "command": "node",
-      "args": ["/Users/alice/mcp-shim/mcp-shim.mjs"],
+      "args": ["/Users/alice/obsidian-mcp-bridge/mcp-shim/mcp-shim.mjs"],
       "env": {
         "MCP_URL": "https://obsidian-mcp.example.com/mcp"
       }
@@ -349,7 +354,7 @@ Restart Claude Desktop after saving.
   "mcpServers": {
     "my-api": {
       "command": "node",
-      "args": ["/Users/alice/mcp-shim/mcp-shim.mjs"],
+      "args": ["/Users/alice/obsidian-mcp-bridge/mcp-shim/mcp-shim.mjs"],
       "env": {
         "MCP_URL": "https://api.example.com/mcp",
         "MCP_TOKEN": "sk-..."
@@ -366,7 +371,7 @@ Restart Claude Desktop after saving.
   "mcpServers": {
     "slow-server": {
       "command": "node",
-      "args": ["/Users/alice/mcp-shim/mcp-shim.mjs"],
+      "args": ["/Users/alice/obsidian-mcp-bridge/mcp-shim/mcp-shim.mjs"],
       "env": {
         "MCP_URL": "https://slow.example.com/mcp",
         "MCP_TIMEOUT": "30000"
