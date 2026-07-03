@@ -88,6 +88,47 @@ function abortSse() {
   sseOpen = false;
 }
 
+// Establish a session with the bridge internally (no stdout output).
+// Multiple concurrent callers share the same in-flight promise.
+let _initPromise = null;
+async function initSession() {
+  if (sessionId) return true;
+  if (_initPromise) return _initPromise;
+  _initPromise = new Promise((resolve) => {
+    process.stderr.write("shim: no session — auto-initializing\n");
+    const body = JSON.stringify({
+      jsonrpc: "2.0", id: "shim-init-" + Date.now(), method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "mcp-shim", version: "1.0" } },
+    });
+    const req = https.request(
+      { hostname, port: port || 443, path: pathname, method: "POST", headers: {
+          ...BASE_HEADERS, "Content-Type": "application/json", Accept: "application/json, text/event-stream",
+        }, timeout: TIMEOUT },
+      (res) => {
+        req.setTimeout(0);
+        if (res.headers["mcp-session-id"]) { sessionId = res.headers["mcp-session-id"]; openSse(); }
+        res.resume(); // discard body — session ID came from the header
+        res.on("end", () => {
+          if (sessionId) {
+            process.stderr.write(`shim: session established: ${sessionId.slice(0, 8)}\n`);
+            // Send notifications/initialized (fire-and-forget)
+            const n = https.request({ hostname, port: port || 443, path: pathname, method: "POST",
+              headers: { ...BASE_HEADERS, "Content-Type": "application/json", "mcp-session-id": sessionId }, timeout: 5000 });
+            n.on("error", () => {});
+            n.end(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
+          }
+          resolve(!!sessionId);
+        });
+        res.on("error", () => resolve(false));
+      },
+    );
+    req.on("timeout", () => { req.destroy(); resolve(false); });
+    req.on("error", (e) => { process.stderr.write(`shim: auto-init error: ${e.message}\n`); resolve(false); });
+    req.end(body);
+  }).finally(() => { _initPromise = null; });
+  return _initPromise;
+}
+
 // Opens the SSE GET stream and forwards events to stdout.
 // Reconnects automatically with exponential backoff on drop.
 function openSse() {
@@ -216,44 +257,59 @@ const rl = createInterface({ input: process.stdin, terminal: false });
 rl.on("close", deleteSession);
 rl.on("line", async (line) => {
   if (!line.trim()) return;
+  let msg = null;
+  try { msg = JSON.parse(line); } catch { /* forward as-is */ }
+
   try {
-    const { status, body } = await post(line);
+    // Auto-initialize if we have no session and this isn't Claude Desktop's own initialize.
+    if (!sessionId && msg?.method !== "initialize") {
+      const ok = await initSession();
+      if (!ok) {
+        if (msg?.id !== undefined) {
+          process.stdout.write(JSON.stringify({
+            jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "MCP session unavailable." },
+          }) + "\n");
+        }
+        return;
+      }
+    }
+
+    const hadSession = !!sessionId;
+    let { status, body } = await post(line);
     if (status === 202) return;
-    if (status === 404 || (status === 400 && sessionId)) {
-      // Session expired or not recognised: 404 per spec, or 400 when sessionId is set. Client MUST re-initialize.
-      process.stderr.write(`shim: session rejected (${status}): ${(body ?? "").slice(0, 200)}; cleared session ID\n`);
+    if (status === 404 || (status === 400 && hadSession)) {
+      // Session expired or not recognised — try to reinitialize once and retry.
+      process.stderr.write(`shim: session rejected (${status}): ${(body ?? "").slice(0, 200)}; reinitializing\n`);
       abortSse();
       sessionId = null;
-      try {
-        const msg = JSON.parse(line);
-        if (msg.id !== undefined) {
-          process.stdout.write(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              id: msg.id,
-              error: { code: -32000, message: "MCP session expired; reinitialize." },
-            }) + "\n",
-          );
+      const ok = await initSession();
+      if (ok) {
+        ({ status, body } = await post(line));
+        if (status === 202) return;
+      }
+      if (status === 404 || !ok) {
+        // Reinit failed or retry also rejected — surface error to client.
+        if (msg?.id !== undefined) {
+          process.stdout.write(JSON.stringify({
+            jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "MCP session expired; reinitialize." },
+          }) + "\n");
         }
-      } catch (e) { process.stderr.write(`shim: could not parse request line: ${e.message}\n`); }
-      return;
+        return;
+      }
     }
     // Requests with an id must always receive a response — send a JSON-RPC error so the
     // client doesn't hang. Body is kept in stderr only to avoid leaking server internals.
     if (status >= 400) {
       process.stderr.write(`shim: POST returned HTTP ${status}: ${(body ?? "").slice(0, 200)}\n`);
-      try {
-        const msg = JSON.parse(line);
-        if (msg.id !== undefined) {
-          process.stdout.write(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              id: msg.id,
-              error: { code: -32000, message: `Upstream error (HTTP ${status}); see shim log for details.` },
-            }) + "\n",
-          );
-        }
-      } catch (e) { process.stderr.write(`shim: could not parse request line: ${e.message}\n`); }
+      if (msg?.id !== undefined) {
+        process.stdout.write(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: { code: -32000, message: `Upstream error (HTTP ${status}); see shim log for details.` },
+          }) + "\n",
+        );
+      }
       return;
     }
     // SSE POST responses are already written to stdout inside post(); only JSON arrives here.

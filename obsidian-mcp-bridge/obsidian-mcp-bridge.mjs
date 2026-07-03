@@ -14,9 +14,13 @@ import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { normPath, isDenied as _isDenied, checkAccess as _checkAccess } from './lib/access.mjs';
 
+const ts = () => new Date().toISOString();
+const log = (...a) => console.log(ts(), ...a);
+const logErr = (...a) => console.error(ts(), ...a);
+
 const LISTEN_PORT  = parseInt(process.env.LISTEN_PORT  || '3002', 10);
 if (Number.isNaN(LISTEN_PORT) || LISTEN_PORT < 1 || LISTEN_PORT > 65535) {
-  console.error('LISTEN_PORT must be a valid port number (1-65535)');
+  logErr('LISTEN_PORT must be a valid port number (1-65535)');
   process.exit(1);
 }
 const BASE_URL     = process.env.MCP_BASE_URL;
@@ -31,15 +35,15 @@ const DENY_PATHS = (process.env.DENY_PATHS || '')
   .filter(Boolean);
 
 if (!BASE_URL) {
-  console.error('Set MCP_BASE_URL env var to the public HTTPS base URL of this bridge (e.g. https://hostname:4001)');
+  logErr('Set MCP_BASE_URL env var to the public HTTPS base URL of this bridge (e.g. https://hostname:4001)');
   process.exit(1);
 }
 if (!CHILD_BIN) {
-  console.error('Set CHILD_BIN env var to the path of the obsidian-mcp binary (e.g. /usr/local/bin/obsidian-mcp)');
+  logErr('Set CHILD_BIN env var to the path of the obsidian-mcp binary (e.g. /usr/local/bin/obsidian-mcp)');
   process.exit(1);
 }
 if (!VAULT) {
-  console.error('Set VAULT env var or pass vault path as first argument');
+  logErr('Set VAULT env var or pass vault path as first argument');
   process.exit(1);
 }
 
@@ -62,13 +66,13 @@ const pending    = new Map(); // globalId → (response) => void
 
 function sendChild(msg) {
   if (!child || child.killed || !child.stdin.writable) {
-    console.error('sendChild: child not available, dropping message');
+    logErr('sendChild: child not available, dropping message');
     return;
   }
   try {
     child.stdin.write(JSON.stringify(msg) + '\n');
   } catch (err) {
-    console.error('sendChild write error:', err.code ?? err.message);
+    logErr('sendChild write error:', err.code ?? err.message);
   }
 }
 
@@ -98,17 +102,17 @@ function scheduleKeepAlive() {
   clearTimeout(childKeepAlive);
   childKeepAlive = setTimeout(async () => {
     if (!child || !childReady) return;
-    console.log('  → keepalive: pinging child');
+    log('  → keepalive: pinging child');
     const r = await callChild({ jsonrpc: '2.0', id: randomUUID(), method: 'tools/list', params: {} }, 10_000);
     if (r.error) {
       // If the child already exited, the exit handler set childReady=false and
       // scheduled a respawn — nothing for us to do. Only force-restart if the
       // child appears to still be running but stopped responding.
       if (childReady) {
-        console.error('keepalive timed out or errored — restarting child:', r.error.message);
+        logErr('keepalive timed out or errored — restarting child:', r.error.message);
         restartChild();
       } else {
-        console.error('keepalive errored after child exit (restart already scheduled):', r.error.message);
+        logErr('keepalive errored after child exit (restart already scheduled):', r.error.message);
       }
     } else {
       if (r.result) childTools = r.result; // refresh cache while we're here
@@ -124,20 +128,20 @@ function spawnChild() {
   const self = child; // captured so data/error listeners can detect replacement
 
   child.stdin.on('error', err => {
-    console.error('child stdin error:', err.code ?? err.message);
+    logErr('child stdin error:', err.code ?? err.message);
   });
 
   child.stdout.on('error', err => {
-    console.error('child stdout error:', err.code ?? err.message);
+    logErr('child stdout error:', err.code ?? err.message);
   });
 
   child.stdout.on('data', chunk => {
     if (child !== self) return; // stale listener from killed child, discard
     const chunkStr = chunk.toString();
-    console.log(`  ← child stdout: ${chunk.length} bytes (buf=${childBuf.length + chunkStr.length}), pending=${pending.size}`);
+    log(`  ← child stdout: ${chunk.length} bytes (buf=${childBuf.length + chunkStr.length}), pending=${pending.size}`);
     childBuf += chunkStr;
     if (childBuf.length > 10 * 1024 * 1024) { // obsidian-mcp messages can be large; 10MB prevents resource exhaustion
-      console.error(`childBuf overflow at ${childBuf.length} bytes (limit=10MB), restarting child`);
+      logErr(`childBuf overflow at ${childBuf.length} bytes (limit=10MB), restarting child`);
       childBuf = '';
       if (child && !child.killed) child.kill('SIGTERM');
       return;
@@ -146,13 +150,13 @@ function spawnChild() {
     while ((nl = childBuf.indexOf('\n')) !== -1) {
       const line = childBuf.slice(0, nl).trim();
       childBuf  = childBuf.slice(nl + 1);
-      console.log(`  ← child line: id=${(() => { try { return JSON.parse(line)?.id ?? 'none'; } catch { return 'parse-err'; } })()} pending=${pending.size}`);
+      log(`  ← child line: id=${(() => { try { return JSON.parse(line)?.id ?? 'none'; } catch { return 'parse-err'; } })()} pending=${pending.size}`);
       if (line) onChildLine(line);
     }
   });
 
   child.on('exit', code => {
-    console.error(`obsidian-mcp exited (${code}), restarting in 3s`);
+    logErr(`obsidian-mcp exited (${code}), restarting in 3s`);
     clearTimeout(childKeepAlive);
     childReady  = false;
     childCaps   = null;
@@ -167,7 +171,7 @@ function spawnChild() {
       childCapResolve = res;
       childCapReject  = rej;
     });
-    childCapPromise.catch(err => console.error('child re-init failed:', err));
+    childCapPromise.catch(err => logErr('child re-init failed:', err));
     setTimeout(spawnChild, 3000);
   });
 
@@ -175,7 +179,7 @@ function spawnChild() {
   const initId = randomUUID();
   pending.set(initId, resp => {
     if (resp.error) {
-      console.error('child init error:', resp.error);
+      logErr('child init error:', resp.error);
       childCapReject(resp.error); // already .catch'd on the promise
       if (everInitialized) {
         // On restart, kill and let the exit handler retry
@@ -195,7 +199,7 @@ function spawnChild() {
     pending.set(toolsId, resp => { if (!resp.error) childTools = resp.result; });
     sendChild({ jsonrpc: '2.0', id: toolsId, method: 'tools/list', params: {} });
 
-    console.log('obsidian-mcp ready');
+    log('obsidian-mcp ready');
     childCapResolve(childCaps);
     scheduleKeepAlive();
   });
@@ -222,7 +226,7 @@ function restartChild() {
   const now = Date.now();
   if (now - lastRestart < 5000) return; // debounce
   lastRestart = now;
-  console.error('restarting stuck child');
+  logErr('restarting stuck child');
   if (child && !child.killed) child.kill('SIGTERM');
 }
 
@@ -239,12 +243,12 @@ async function callChild(request, timeoutMs = 60_000) {
   const t0 = Date.now();
   const argsLog = request.method === 'tools/call' && request.params?.arguments
     ? ' args=' + JSON.stringify(request.params.arguments) : '';
-  console.log(`  ⟶ child: ${label}${argsLog} [${globalId.slice(0, 8)}] pending=${pending.size + 1}`);
+  log(`  ⟶ child: ${label}${argsLog} [${globalId.slice(0, 8)}] pending=${pending.size + 1}`);
 
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pending.delete(globalId);
-      console.log(`  ✗ timeout: ${label} [${globalId.slice(0, 8)}] after ${Date.now() - t0}ms pending=${pending.size}`);
+      log(`  ✗ timeout: ${label} [${globalId.slice(0, 8)}] after ${Date.now() - t0}ms pending=${pending.size}`);
       resolve({ jsonrpc: '2.0', id: origId, error: { code: -32603, message: `timeout: ${request.method}` } });
       // Do NOT restart the child here — it may just be slow (e.g. USB disk read).
       // The child is only restarted if it actually exits/crashes (see exit handler).
@@ -254,7 +258,7 @@ async function callChild(request, timeoutMs = 60_000) {
       clearTimeout(timer);
       const ms = Date.now() - t0;
       const status = resp.error ? `error(${resp.error.code})` : 'ok';
-      console.log(`  ✓ ${label} [${globalId.slice(0, 8)}] ${status} in ${ms}ms pending=${pending.size - 1}`);
+      log(`  ✓ ${label} [${globalId.slice(0, 8)}] ${status} in ${ms}ms pending=${pending.size - 1}`);
       resolve({ ...resp, id: origId });
     });
 
@@ -280,7 +284,7 @@ function broadcastNotification(msg) {
     } catch (err) {
       const code = err.code;
       if (code !== 'EPIPE' && code !== 'ERR_STREAM_DESTROYED') {
-        console.error(`broadcastNotification error for sid ${sid.slice(0, 8)}:`, err.message);
+        logErr(`broadcastNotification error for sid ${sid.slice(0, 8)}:`, err.message);
       }
       // Always prune the broken stream and its session regardless of error type.
       sseStreams.delete(sid);
@@ -356,12 +360,12 @@ const server = http.createServer(async (req, res) => {
   const safeMethod = req.method?.replace(/[^\w-]/g, '?') ?? 'UNKNOWN';
   const safeUrl    = (url ?? '').replace(/[^\w/.-]/g, '?');
   const safeSid    = sid.slice(0, 8) || 'none';
-  console.log(`${safeMethod} ${safeUrl} sid=${safeSid}`);
+  log(`${safeMethod} ${safeUrl} sid=${safeSid}`);
 
   try {
     await route(req, res, url, sid);
   } catch (err) {
-    console.error('unhandled:', err);
+    logErr('unhandled:', err);
     if (!res.headersSent) { res.writeHead(500); res.end(); }
   }
 });
@@ -468,12 +472,12 @@ async function route(req, res, url, sid) {
   let body = '';
   for await (const chunk of req) {
     if (body.length + chunk.length > 10 * 1024 * 1024) { // raised from 1MB to accommodate large obsidian-mcp messages
-      console.error(`request body too large at ${body.length + chunk.length} bytes (limit=10MB)`);
+      logErr(`request body too large at ${body.length + chunk.length} bytes (limit=10MB)`);
       req.destroy(); res.writeHead(413); return res.end('request too large');
     }
     body += chunk;
   }
-  if (body.length > 10_000) console.log(`  → request body: ${body.length} bytes`);
+  if (body.length > 10_000) log(`  → request body: ${body.length} bytes`);
 
   let msg;
   try { msg = JSON.parse(body); } catch {
@@ -486,7 +490,7 @@ async function route(req, res, url, sid) {
 
   // Log the JSON-RPC method (and tool name for tools/call) so requests are traceable.
   const toolName = msg.method === 'tools/call' ? ` (${msg.params?.name ?? '?'})` : '';
-  console.log(`  → ${msg.method ?? '?'}${toolName} sid=${sid.slice(0, 8) || 'none'}`);
+  log(`  → ${msg.method ?? '?'}${toolName} sid=${sid.slice(0, 8) || 'none'}`);
 
   // initialize → new session, no forwarding needed
   if (msg.method === 'initialize') {
@@ -544,7 +548,7 @@ async function route(req, res, url, sid) {
     const denied = checkAccess(msg.params?.name, msg.params?.arguments ?? {});
     if (denied) {
       const safeName = String(msg.params?.name ?? '').replace(/[\r\n]/g, '?');
-      console.log(`DENY ${safeName}: ${denied}`);
+      log(`DENY ${safeName}: ${denied}`);
       return sendSse(res, 200, sid, [{
         jsonrpc: '2.0',
         id: msgId,
@@ -592,11 +596,11 @@ spawnChild();
 childCapPromise.then(
   () => {
     server.listen(LISTEN_PORT, '127.0.0.1', () => {
-      console.log(`obsidian-mcp bridge listening on 127.0.0.1:${LISTEN_PORT}`);
+      log(`obsidian-mcp bridge listening on 127.0.0.1:${LISTEN_PORT}`);
     });
   },
   err => {
-    console.error('child failed to initialize:', err);
+    logErr('child failed to initialize:', err);
     process.exit(1);
   },
 );
