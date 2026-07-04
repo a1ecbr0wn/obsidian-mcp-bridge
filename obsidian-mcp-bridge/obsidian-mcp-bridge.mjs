@@ -12,6 +12,8 @@
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { normPath, isDenied as _isDenied, checkAccess as _checkAccess } from './lib/access.mjs';
 
 const ts = () => new Date().toISOString();
@@ -271,6 +273,63 @@ async function callChild(request, timeoutMs = 60_000) {
 // Bind module-level DENY_PATHS into the imported pure functions.
 const isDenied    = path             => _isDenied(DENY_PATHS, path);
 const checkAccess = (toolName, args) => _checkAccess(DENY_PATHS, toolName, args);
+
+// ── Bridge-native tools ────────────────────────────────────────────────────
+
+// Parses YAML frontmatter tags from markdown content.
+// Handles both `tags: [a, b]` and block sequence formats.
+function parseFrontmatterTags(content) {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!match) return [];
+  const fm = match[1];
+  const inline = fm.match(/^tags:\s*\[([^\]]*)\]/m);
+  if (inline) {
+    return inline[1].split(',').map(t => t.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+  }
+  const block = fm.match(/^tags:\s*\r?\n((?:[ \t]+-[^\r\n]*(?:\r?\n|$))*)/m);
+  if (block) {
+    return block[1].split('\n').map(l => l.replace(/^[ \t]+-\s*/, '').trim()).filter(Boolean);
+  }
+  return [];
+}
+
+async function walkVault(dir, cb) {
+  let entries;
+  try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) await walkVault(full, cb);
+    else if (entry.isFile() && entry.name.endsWith('.md')) await cb(full);
+  }
+}
+
+const BRIDGE_TOOLS = [
+  {
+    name: 'list-tags',
+    description: 'List all unique tags (from YAML frontmatter) used across vault notes. Optionally scope to a subdirectory.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault: { type: 'string', description: 'Vault name' },
+        path:  { type: 'string', description: 'Optional vault-relative path to scope the search' },
+      },
+      required: ['vault'],
+    },
+  },
+  {
+    name: 'search-tag',
+    description: 'Find notes that have ALL of the specified tags (YAML frontmatter). Returns vault-relative paths.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault: { type: 'string', description: 'Vault name' },
+        tags:  { type: 'array', items: { type: 'string' }, description: 'Tags that notes must all have' },
+        path:  { type: 'string', description: 'Optional vault-relative path to scope the search' },
+      },
+      required: ['vault', 'tags'],
+    },
+  },
+];
 
 // ── SSE streams (GET /mcp per session) ────────────────────────────────────
 
@@ -533,7 +592,8 @@ async function route(req, res, url, sid) {
     return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: { prompts: [] } }]);
   }
   if (msg.method === 'tools/list' && childTools) {
-    return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: childTools }]);
+    const result = { ...childTools, tools: [...childTools.tools, ...BRIDGE_TOOLS] };
+    return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result }]);
   }
 
   // list-available-vaults is answered directly from the VAULT env var — never hits the child
@@ -557,8 +617,96 @@ async function route(req, res, url, sid) {
     }
   }
 
+  // ── bridge-native tool handlers ──────────────────────────────────────────
+  if (msg.method === 'tools/call' && msg.params?.name === 'list-tags') {
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: `Unknown vault: ${args.vault}` }], isError: true,
+      } }]);
+    }
+    const relScope = args.path ? normPath(args.path) : null;
+    if (relScope && isDenied(relScope)) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: 'Access denied' }], isError: true,
+      } }]);
+    }
+    const scopePath = relScope ? path.join(VAULT, relScope) : VAULT;
+    try {
+      const tags = new Set();
+      await walkVault(scopePath, async (filePath) => {
+        const rel = path.relative(VAULT, filePath);
+        if (isDenied(rel)) return;
+        const content = await fs.readFile(filePath, 'utf8');
+        for (const tag of parseFrontmatterTags(content)) tags.add(tag);
+      });
+      const sorted = [...tags].sort();
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: sorted.length ? sorted.join('\n') : 'No tags found' }],
+      } }]);
+    } catch (err) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: `Error listing tags: ${err.message.replaceAll(VAULT + '/', '')}` }], isError: true,
+      } }]);
+    }
+  }
+
+  if (msg.method === 'tools/call' && msg.params?.name === 'search-tag') {
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: `Unknown vault: ${args.vault}` }], isError: true,
+      } }]);
+    }
+    const queryTags = Array.isArray(args.tags) ? args.tags.map(t => String(t).toLowerCase()) : [];
+    if (!queryTags.length) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: 'No tags specified' }], isError: true,
+      } }]);
+    }
+    const relScope = args.path ? normPath(args.path) : null;
+    if (relScope && isDenied(relScope)) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: 'Access denied' }], isError: true,
+      } }]);
+    }
+    const scopePath = relScope ? path.join(VAULT, relScope) : VAULT;
+    try {
+      const matches = [];
+      await walkVault(scopePath, async (filePath) => {
+        const rel = path.relative(VAULT, filePath);
+        if (isDenied(rel)) return;
+        const content = await fs.readFile(filePath, 'utf8');
+        const noteTags = parseFrontmatterTags(content).map(t => t.toLowerCase());
+        if (queryTags.every(t => noteTags.includes(t))) matches.push(rel);
+      });
+      matches.sort();
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: matches.length ? matches.join('\n') : 'No notes found' }],
+      } }]);
+    } catch (err) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: `Error searching tags: ${err.message.replaceAll(VAULT + '/', '')}` }], isError: true,
+      } }]);
+    }
+  }
+
   // requests → forward to child, return SSE response
   const response = await callChild({ ...msg, id: msgId });
+  // MCP spec: tool execution errors must come back as result.isError, not JSON-RPC errors.
+  // obsidian-mcp uses JSON-RPC errors for tool failures — convert them so clients see the message.
+  if (msg.method === 'tools/call' && response.error) {
+    const errText = (response.error.message ?? 'Tool execution failed')
+      .replaceAll(VAULT + '/', '');
+    return sendSse(res, 200, sid, [{
+      jsonrpc: '2.0',
+      id: msgId,
+      result: {
+        content: [{ type: 'text', text: errText }],
+        isError: true,
+      },
+    }]);
+  }
   return sendSse(res, 200, sid, [response]);
 }
 
