@@ -305,6 +305,18 @@ async function walkVault(dir, cb) {
 
 const BRIDGE_TOOLS = [
   {
+    name: 'list-notes',
+    description: 'List all notes in the vault, or scoped to a folder. Returns sorted vault-relative paths.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault: { type: 'string', description: 'Vault name' },
+        path:  { type: 'string', description: 'Optional vault-relative folder to scope the listing' },
+      },
+      required: ['vault'],
+    },
+  },
+  {
     name: 'list-tags',
     description: 'List all unique tags (from YAML frontmatter) used across vault notes. Optionally scope to a subdirectory.',
     inputSchema: {
@@ -327,6 +339,32 @@ const BRIDGE_TOOLS = [
         path:  { type: 'string', description: 'Optional vault-relative path to scope the search' },
       },
       required: ['vault', 'tags'],
+    },
+  },
+  {
+    name: 'new-notes',
+    description: 'List notes created in the last 7 days, or since a provided ISO 8601 timestamp. Returns vault-relative paths.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault: { type: 'string', description: 'Vault name' },
+        since: { type: 'string', description: 'ISO 8601 timestamp; defaults to 7 days ago' },
+        path:  { type: 'string', description: 'Optional vault-relative path to scope the search' },
+      },
+      required: ['vault'],
+    },
+  },
+  {
+    name: 'changed-notes',
+    description: 'List notes modified in the last 7 days, or since a provided ISO 8601 timestamp. Returns vault-relative paths.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault: { type: 'string', description: 'Vault name' },
+        since: { type: 'string', description: 'ISO 8601 timestamp; defaults to 7 days ago' },
+        path:  { type: 'string', description: 'Optional vault-relative path to scope the search' },
+      },
+      required: ['vault'],
     },
   },
 ];
@@ -618,6 +656,38 @@ async function route(req, res, url, sid) {
   }
 
   // ── bridge-native tool handlers ──────────────────────────────────────────
+  if (msg.method === 'tools/call' && msg.params?.name === 'list-notes') {
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: `Unknown vault: ${args.vault}` }], isError: true,
+      } }]);
+    }
+    const relScope = args.path ? normPath(args.path) : null;
+    if (relScope && isDenied(relScope)) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: 'Access denied' }], isError: true,
+      } }]);
+    }
+    const scopePath = relScope ? path.join(VAULT, relScope) : VAULT;
+    try {
+      const notes = [];
+      await walkVault(scopePath, async (filePath) => {
+        const rel = path.relative(VAULT, filePath);
+        if (isDenied(rel)) return;
+        notes.push(rel);
+      });
+      notes.sort();
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: notes.length ? notes.join('\n') : 'No notes found' }],
+      } }]);
+    } catch (err) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: `Error listing notes: ${err.message.replaceAll(VAULT + '/', '')}` }], isError: true,
+      } }]);
+    }
+  }
+
   if (msg.method === 'tools/call' && msg.params?.name === 'list-tags') {
     const args = msg.params.arguments ?? {};
     if (args.vault !== VAULT_NAME) {
@@ -687,6 +757,52 @@ async function route(req, res, url, sid) {
     } catch (err) {
       return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
         content: [{ type: 'text', text: `Error searching tags: ${err.message.replaceAll(VAULT + '/', '')}` }], isError: true,
+      } }]);
+    }
+  }
+
+  if (msg.method === 'tools/call' && (msg.params?.name === 'new-notes' || msg.params?.name === 'changed-notes')) {
+    const toolName = msg.params.name;
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: `Unknown vault: ${args.vault}` }], isError: true,
+      } }]);
+    }
+    let cutoffMs;
+    if (args.since !== undefined) {
+      cutoffMs = new Date(args.since).getTime();
+      if (Number.isNaN(cutoffMs)) {
+        return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+          content: [{ type: 'text', text: `Invalid since timestamp: ${args.since}` }], isError: true,
+        } }]);
+      }
+    } else {
+      cutoffMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    }
+    const relScope = args.path ? normPath(args.path) : null;
+    if (relScope && isDenied(relScope)) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: 'Access denied' }], isError: true,
+      } }]);
+    }
+    const scopePath = relScope ? path.join(VAULT, relScope) : VAULT;
+    try {
+      const matches = [];
+      await walkVault(scopePath, async (filePath) => {
+        const rel = path.relative(VAULT, filePath);
+        if (isDenied(rel)) return;
+        const stat = await fs.stat(filePath);
+        const timeMs = toolName === 'new-notes' ? stat.birthtimeMs : stat.mtimeMs;
+        if (timeMs >= cutoffMs) matches.push(rel);
+      });
+      matches.sort();
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: matches.length ? matches.join('\n') : 'No notes found' }],
+      } }]);
+    } catch (err) {
+      return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
+        content: [{ type: 'text', text: `Error: ${err.message.replaceAll(VAULT + '/', '')}` }], isError: true,
       } }]);
     }
   }
