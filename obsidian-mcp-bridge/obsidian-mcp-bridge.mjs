@@ -15,6 +15,17 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { normPath, isDenied as _isDenied, checkAccess as _checkAccess } from './lib/access.mjs';
+import { parseTags as fmParseTags, addTags as fmAddTags, removeTags as fmRemoveTags, renameTag as fmRenameTag } from './lib/frontmatter.mjs';
+import { escRe } from './lib/utils.mjs';
+import {
+  walkVault as libWalkVault,
+  readNote as libReadNote,
+  writeNote as libWriteNote,
+  deleteNote as libDeleteNote,
+  moveNote as libMoveNote,
+  searchContent as libSearchContent,
+  searchFilename as libSearchFilename,
+} from './lib/vault.mjs';
 
 const ts = () => new Date().toISOString();
 const log = (...a) => console.log(ts(), ...a);
@@ -274,34 +285,11 @@ async function callChild(request, timeoutMs = 60_000) {
 const isDenied    = path             => _isDenied(DENY_PATHS, path);
 const checkAccess = (toolName, args) => _checkAccess(DENY_PATHS, toolName, args);
 
+const toolOk  = (res, sid, id, text) => sendSse(res, 200, sid, [{ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } }]);
+const toolErr = (res, sid, id, text) => sendSse(res, 200, sid, [{ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError: true } }]);
+
 // ── Bridge-native tools ────────────────────────────────────────────────────
 
-// Parses YAML frontmatter tags from markdown content.
-// Handles both `tags: [a, b]` and block sequence formats.
-function parseFrontmatterTags(content) {
-  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-  if (!match) return [];
-  const fm = match[1];
-  const inline = fm.match(/^tags:\s*\[([^\]]*)\]/m);
-  if (inline) {
-    return inline[1].split(',').map(t => t.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
-  }
-  const block = fm.match(/^tags:\s*\r?\n((?:[ \t]+-[^\r\n]*(?:\r?\n|$))*)/m);
-  if (block) {
-    return block[1].split('\n').map(l => l.replace(/^[ \t]+-\s*/, '').trim()).filter(Boolean);
-  }
-  return [];
-}
-
-async function walkVault(dir, cb) {
-  let entries;
-  try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
-  for (const entry of entries) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) await walkVault(full, cb);
-    else if (entry.isFile() && entry.name.endsWith('.md')) await cb(full);
-  }
-}
 
 const BRIDGE_TOOLS = [
   {
@@ -365,6 +353,149 @@ const BRIDGE_TOOLS = [
         path:  { type: 'string', description: 'Optional vault-relative path to scope the search' },
       },
       required: ['vault'],
+    },
+  },
+  {
+    name: 'list-available-vaults',
+    description: 'List all available Obsidian vaults.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'read-note',
+    description: 'Read the content of a note.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault:    { type: 'string', description: 'Vault name' },
+        filename: { type: 'string', description: 'Filename including .md extension' },
+        folder:   { type: 'string', description: 'Optional vault-relative folder' },
+      },
+      required: ['vault', 'filename'],
+    },
+  },
+  {
+    name: 'create-note',
+    description: 'Create a new note. Fails if the note already exists.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault:    { type: 'string', description: 'Vault name' },
+        filename: { type: 'string', description: 'Filename including .md extension' },
+        folder:   { type: 'string', description: 'Optional vault-relative folder' },
+        content:  { type: 'string', description: 'Markdown content' },
+      },
+      required: ['vault', 'filename'],
+    },
+  },
+  {
+    name: 'edit-note',
+    description: 'Edit an existing note by appending, prepending, or replacing its content.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault:     { type: 'string', description: 'Vault name' },
+        filename:  { type: 'string', description: 'Filename including .md extension' },
+        folder:    { type: 'string', description: 'Optional vault-relative folder' },
+        operation: { type: 'string', enum: ['append', 'prepend', 'replace'], description: 'Edit operation' },
+        content:   { type: 'string', description: 'Content to apply' },
+      },
+      required: ['vault', 'filename', 'operation', 'content'],
+    },
+  },
+  {
+    name: 'delete-note',
+    description: 'Delete a note, moving it to .trash by default.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault:     { type: 'string', description: 'Vault name' },
+        filename:  { type: 'string', description: 'Filename including .md extension' },
+        folder:    { type: 'string', description: 'Optional vault-relative folder' },
+        permanent: { type: 'boolean', description: 'If true, permanently delete instead of trashing' },
+      },
+      required: ['vault', 'filename'],
+    },
+  },
+  {
+    name: 'move-note',
+    description: 'Move or rename a note, rewriting all vault-wide wikilinks to the old path.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault:       { type: 'string', description: 'Vault name' },
+        filename:    { type: 'string', description: 'Source filename including .md extension' },
+        folder:      { type: 'string', description: 'Optional source vault-relative folder' },
+        newFilename: { type: 'string', description: 'Destination filename including .md extension' },
+        newFolder:   { type: 'string', description: 'Optional destination vault-relative folder' },
+      },
+      required: ['vault', 'filename', 'newFilename'],
+    },
+  },
+  {
+    name: 'create-directory',
+    description: 'Create a new directory (and any missing parents) in the vault.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault:  { type: 'string', description: 'Vault name' },
+        folder: { type: 'string', description: 'Vault-relative path for the new directory' },
+      },
+      required: ['vault', 'folder'],
+    },
+  },
+  {
+    name: 'search-vault',
+    description: 'Search vault notes by content, filename, or both (case-insensitive). Content results include line numbers.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault:      { type: 'string', description: 'Vault name' },
+        query:      { type: 'string', description: 'Search query' },
+        searchType: { type: 'string', enum: ['content', 'filename', 'both'], description: 'What to search' },
+        path:       { type: 'string', description: 'Optional vault-relative path to scope the search' },
+      },
+      required: ['vault', 'query', 'searchType'],
+    },
+  },
+  {
+    name: 'add-tags',
+    description: 'Add tags to notes in frontmatter and/or inline body content.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault:    { type: 'string', description: 'Vault name' },
+        files:    { type: 'array', items: { type: 'string' }, description: 'Vault-relative note paths' },
+        tags:     { type: 'array', items: { type: 'string' }, description: 'Tags to add' },
+        location: { type: 'string', enum: ['frontmatter', 'content', 'both'], description: 'Where to add tags (default: frontmatter)' },
+      },
+      required: ['vault', 'files', 'tags'],
+    },
+  },
+  {
+    name: 'remove-tags',
+    description: 'Remove tags from notes in frontmatter and/or inline body content.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault:    { type: 'string', description: 'Vault name' },
+        files:    { type: 'array', items: { type: 'string' }, description: 'Vault-relative note paths' },
+        tags:     { type: 'array', items: { type: 'string' }, description: 'Tags to remove' },
+        location: { type: 'string', enum: ['frontmatter', 'content', 'both'], description: 'Where to remove tags (default: frontmatter)' },
+      },
+      required: ['vault', 'files', 'tags'],
+    },
+  },
+  {
+    name: 'rename-tag',
+    description: 'Rename a tag throughout the entire vault (frontmatter and inline content).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        vault:  { type: 'string', description: 'Vault name' },
+        oldTag: { type: 'string', description: 'Tag to rename' },
+        newTag: { type: 'string', description: 'New tag name' },
+      },
+      required: ['vault', 'oldTag', 'newTag'],
     },
   },
 ];
@@ -630,7 +761,10 @@ async function route(req, res, url, sid) {
     return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: { prompts: [] } }]);
   }
   if (msg.method === 'tools/list' && childTools) {
-    const result = { ...childTools, tools: [...childTools.tools, ...BRIDGE_TOOLS] };
+    // Bridge-native tools supersede child tools of the same name.
+    const bridgeNames = new Set(BRIDGE_TOOLS.map(t => t.name));
+    const filteredChild = childTools.tools.filter(t => !bridgeNames.has(t.name));
+    const result = { ...childTools, tools: [...filteredChild, ...BRIDGE_TOOLS] };
     return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result }]);
   }
 
@@ -672,7 +806,7 @@ async function route(req, res, url, sid) {
     const scopePath = relScope ? path.join(VAULT, relScope) : VAULT;
     try {
       const notes = [];
-      await walkVault(scopePath, async (filePath) => {
+      await libWalkVault(scopePath, async (filePath) => {
         const rel = path.relative(VAULT, filePath);
         if (isDenied(rel)) return;
         notes.push(rel);
@@ -704,11 +838,11 @@ async function route(req, res, url, sid) {
     const scopePath = relScope ? path.join(VAULT, relScope) : VAULT;
     try {
       const tags = new Set();
-      await walkVault(scopePath, async (filePath) => {
+      await libWalkVault(scopePath, async (filePath) => {
         const rel = path.relative(VAULT, filePath);
         if (isDenied(rel)) return;
         const content = await fs.readFile(filePath, 'utf8');
-        for (const tag of parseFrontmatterTags(content)) tags.add(tag);
+        for (const tag of fmParseTags(content)) tags.add(tag);
       });
       const sorted = [...tags].sort();
       return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
@@ -743,11 +877,11 @@ async function route(req, res, url, sid) {
     const scopePath = relScope ? path.join(VAULT, relScope) : VAULT;
     try {
       const matches = [];
-      await walkVault(scopePath, async (filePath) => {
+      await libWalkVault(scopePath, async (filePath) => {
         const rel = path.relative(VAULT, filePath);
         if (isDenied(rel)) return;
         const content = await fs.readFile(filePath, 'utf8');
-        const noteTags = parseFrontmatterTags(content).map(t => t.toLowerCase());
+        const noteTags = fmParseTags(content).map(t => t.toLowerCase());
         if (queryTags.every(t => noteTags.includes(t))) matches.push(rel);
       });
       matches.sort();
@@ -789,7 +923,7 @@ async function route(req, res, url, sid) {
     const scopePath = relScope ? path.join(VAULT, relScope) : VAULT;
     try {
       const matches = [];
-      await walkVault(scopePath, async (filePath) => {
+      await libWalkVault(scopePath, async (filePath) => {
         const rel = path.relative(VAULT, filePath);
         if (isDenied(rel)) return;
         const stat = await fs.stat(filePath);
@@ -804,6 +938,215 @@ async function route(req, res, url, sid) {
       return sendSse(res, 200, sid, [{ jsonrpc: '2.0', id: msgId, result: {
         content: [{ type: 'text', text: `Error: ${err.message.replaceAll(VAULT + '/', '')}` }], isError: true,
       } }]);
+    }
+  }
+
+  // ── Phase 2 bridge-native handlers ──────────────────────────────────────
+
+  if (msg.method === 'tools/call' && msg.params?.name === 'read-note') {
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) return toolErr(res, sid, msgId, `Unknown vault: ${args.vault}`);
+    const relPath = normPath(args.folder, args.filename);
+    if (!relPath) return toolErr(res, sid, msgId, 'filename is required');
+    if (isDenied(relPath)) return toolErr(res, sid, msgId, 'Access denied');
+    try {
+      const content = await libReadNote(path.join(VAULT, relPath));
+      return toolOk(res, sid, msgId, content);
+    } catch (err) {
+      return toolErr(res, sid, msgId, err.message.replaceAll(VAULT + '/', ''));
+    }
+  }
+
+  if (msg.method === 'tools/call' && msg.params?.name === 'create-note') {
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) return toolErr(res, sid, msgId, `Unknown vault: ${args.vault}`);
+    const relPath = normPath(args.folder, args.filename);
+    if (!relPath) return toolErr(res, sid, msgId, 'filename is required');
+    if (isDenied(relPath)) return toolErr(res, sid, msgId, 'Access denied');
+    const absPath = path.join(VAULT, relPath);
+    try {
+      await fs.access(absPath);
+      return toolErr(res, sid, msgId, `Note already exists: ${relPath}`);
+    } catch (err) {
+      if (err.code !== 'ENOENT') return toolErr(res, sid, msgId, err.message.replaceAll(VAULT + '/', ''));
+    }
+    try {
+      await libWriteNote(absPath, args.content ?? '');
+      return toolOk(res, sid, msgId, `Created: ${relPath}`);
+    } catch (err) {
+      return toolErr(res, sid, msgId, err.message.replaceAll(VAULT + '/', ''));
+    }
+  }
+
+  if (msg.method === 'tools/call' && msg.params?.name === 'edit-note') {
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) return toolErr(res, sid, msgId, `Unknown vault: ${args.vault}`);
+    const relPath = normPath(args.folder, args.filename);
+    if (!relPath) return toolErr(res, sid, msgId, 'filename is required');
+    if (isDenied(relPath)) return toolErr(res, sid, msgId, 'Access denied');
+    const op = args.operation;
+    if (!['append', 'prepend', 'replace'].includes(op))
+      return toolErr(res, sid, msgId, `Invalid operation: ${op}`);
+    const absPath = path.join(VAULT, relPath);
+    try {
+      if (op === 'replace') {
+        await libWriteNote(absPath, args.content ?? '');
+      } else {
+        const existing = await libReadNote(absPath);
+        const newContent = args.content ?? '';
+        const updated = op === 'append' ? existing + newContent : newContent + existing;
+        await libWriteNote(absPath, updated);
+      }
+      return toolOk(res, sid, msgId, `Edited (${op}): ${relPath}`);
+    } catch (err) {
+      return toolErr(res, sid, msgId, err.message.replaceAll(VAULT + '/', ''));
+    }
+  }
+
+  if (msg.method === 'tools/call' && msg.params?.name === 'delete-note') {
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) return toolErr(res, sid, msgId, `Unknown vault: ${args.vault}`);
+    const relPath = normPath(args.folder, args.filename);
+    if (!relPath) return toolErr(res, sid, msgId, 'filename is required');
+    if (isDenied(relPath)) return toolErr(res, sid, msgId, 'Access denied');
+    try {
+      const permanent = args.permanent === true;
+      await libDeleteNote(path.join(VAULT, relPath), permanent, VAULT);
+      return toolOk(res, sid, msgId, permanent ? `Deleted: ${relPath}` : `Moved to trash: ${relPath}`);
+    } catch (err) {
+      return toolErr(res, sid, msgId, err.message.replaceAll(VAULT + '/', ''));
+    }
+  }
+
+  if (msg.method === 'tools/call' && msg.params?.name === 'move-note') {
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) return toolErr(res, sid, msgId, `Unknown vault: ${args.vault}`);
+    const srcRel = normPath(args.folder, args.filename);
+    const dstRel = normPath(args.newFolder, args.newFilename);
+    if (!srcRel) return toolErr(res, sid, msgId, 'filename is required');
+    if (!dstRel) return toolErr(res, sid, msgId, 'newFilename is required');
+    if (isDenied(srcRel)) return toolErr(res, sid, msgId, 'Access denied: source is restricted');
+    if (isDenied(dstRel)) return toolErr(res, sid, msgId, 'Access denied: destination is restricted');
+    try {
+      await libMoveNote(VAULT, path.join(VAULT, srcRel), path.join(VAULT, dstRel), DENY_PATHS);
+      return toolOk(res, sid, msgId, `Moved: ${srcRel} → ${dstRel}`);
+    } catch (err) {
+      return toolErr(res, sid, msgId, err.message.replaceAll(VAULT + '/', ''));
+    }
+  }
+
+  if (msg.method === 'tools/call' && msg.params?.name === 'create-directory') {
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) return toolErr(res, sid, msgId, `Unknown vault: ${args.vault}`);
+    const relPath = normPath(args.folder);
+    if (!relPath) return toolErr(res, sid, msgId, 'folder is required');
+    if (isDenied(relPath)) return toolErr(res, sid, msgId, 'Access denied');
+    try {
+      await fs.mkdir(path.join(VAULT, relPath), { recursive: true });
+      return toolOk(res, sid, msgId, `Created directory: ${relPath}`);
+    } catch (err) {
+      return toolErr(res, sid, msgId, err.message.replaceAll(VAULT + '/', ''));
+    }
+  }
+
+  if (msg.method === 'tools/call' && msg.params?.name === 'search-vault') {
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) return toolErr(res, sid, msgId, `Unknown vault: ${args.vault}`);
+    if (!args.query) return toolErr(res, sid, msgId, 'query is required');
+    const sType = args.searchType || 'content';
+    if (!['content', 'filename', 'both'].includes(sType))
+      return toolErr(res, sid, msgId, `Invalid searchType: ${sType}`);
+    const relScope = args.path ? normPath(args.path) : null;
+    if (relScope && isDenied(relScope)) return toolErr(res, sid, msgId, 'Access denied');
+    const scopeDir = relScope ? path.join(VAULT, relScope) : VAULT;
+    try {
+      const lines = [];
+      if (sType === 'content' || sType === 'both') {
+        const results = await libSearchContent(VAULT, args.query, scopeDir, DENY_PATHS);
+        for (const { path: p, matches } of results)
+          for (const { line, text } of matches)
+            lines.push(`${p}:${line}: ${text.trim()}`);
+      }
+      if (sType === 'filename' || sType === 'both') {
+        const results = await libSearchFilename(VAULT, args.query, scopeDir, DENY_PATHS);
+        for (const p of results) lines.push(p);
+      }
+      return toolOk(res, sid, msgId, lines.length ? lines.join('\n') : 'No results found');
+    } catch (err) {
+      return toolErr(res, sid, msgId, err.message.replaceAll(VAULT + '/', ''));
+    }
+  }
+
+  if (msg.method === 'tools/call' && (msg.params?.name === 'add-tags' || msg.params?.name === 'remove-tags')) {
+    const isAdd = msg.params.name === 'add-tags';
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) return toolErr(res, sid, msgId, `Unknown vault: ${args.vault}`);
+    const files = Array.isArray(args.files) ? args.files : [];
+    const tags  = Array.isArray(args.tags)  ? args.tags  : [];
+    if (!files.length) return toolErr(res, sid, msgId, 'files array is required');
+    if (!tags.length)  return toolErr(res, sid, msgId, 'tags array is required');
+    const location = args.location || 'frontmatter';
+    const updated = [], skipped = [];
+    for (const file of files) {
+      const relPath = normPath(file);
+      if (isDenied(relPath)) { skipped.push(`${relPath} (access denied)`); continue; }
+      try {
+        let content = await libReadNote(path.join(VAULT, relPath));
+        const original = content;
+        if (location === 'frontmatter' || location === 'both') {
+          content = isAdd ? fmAddTags(content, tags) : fmRemoveTags(content, tags);
+        }
+        if (location === 'content' || location === 'both') {
+          if (isAdd) {
+            const body = content.trimEnd();
+            const boundary = `(?![a-zA-Z0-9_/\\-])`;
+            const toAdd = tags.filter(t => !new RegExp(`(?:^|[ \\t])#${escRe(t)}${boundary}`, 'm').test(body));
+            if (toAdd.length) content = body + '\n' + toAdd.map(t => `#${t}`).join(' ') + '\n';
+          } else {
+            for (const tag of tags) {
+              const esc = escRe(tag);
+              const boundary = `(?![a-zA-Z0-9_/\\-])`;
+              // Remove at start-of-line (consuming trailing whitespace so no blank gap)
+              content = content.replace(new RegExp(`^#${esc}${boundary}[ \\t]*`, 'gm'), '');
+              // Remove inline (preceded by whitespace — drop the space too)
+              content = content.replace(new RegExp(`[ \\t]#${esc}${boundary}`, 'gm'), '');
+            }
+          }
+        }
+        if (content !== original) {
+          await libWriteNote(path.join(VAULT, relPath), content);
+          updated.push(relPath);
+        }
+      } catch (err) {
+        skipped.push(`${relPath} (${err.message.replaceAll(VAULT + '/', '')})`);
+      }
+    }
+    const parts = [];
+    if (updated.length) parts.push(`Updated ${updated.length} note(s): ${updated.join(', ')}`);
+    if (skipped.length) parts.push(`Skipped: ${skipped.join(', ')}`);
+    return toolOk(res, sid, msgId, parts.join('\n') || 'No changes needed');
+  }
+
+  if (msg.method === 'tools/call' && msg.params?.name === 'rename-tag') {
+    const args = msg.params.arguments ?? {};
+    if (args.vault !== VAULT_NAME) return toolErr(res, sid, msgId, `Unknown vault: ${args.vault}`);
+    if (!args.oldTag) return toolErr(res, sid, msgId, 'oldTag is required');
+    if (!args.newTag) return toolErr(res, sid, msgId, 'newTag is required');
+    try {
+      let count = 0;
+      await libWalkVault(VAULT, async filePath => {
+        const rel = path.relative(VAULT, filePath);
+        if (isDenied(rel)) return;
+        let content;
+        try { content = await libReadNote(filePath); } catch { return; }
+        const updated = fmRenameTag(content, args.oldTag, args.newTag);
+        if (updated !== content) {
+          try { await libWriteNote(filePath, updated); count++; } catch {}
+        }
+      });
+      return toolOk(res, sid, msgId, `Renamed tag '${args.oldTag}' → '${args.newTag}' in ${count} note(s)`);
+    } catch (err) {
+      return toolErr(res, sid, msgId, err.message.replaceAll(VAULT + '/', ''));
     }
   }
 

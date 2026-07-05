@@ -122,34 +122,46 @@ describe('checkAccess', () => {
 
   describe('delete-note', () => {
     it('blocks denied path', () => {
-      const r = checkAccess(DENY, 'delete-note', { path: 'people/alice.md' });
+      const r = checkAccess(DENY, 'delete-note', { folder: 'people', filename: 'alice.md' });
       assert.ok(r?.includes('restricted'));
     });
 
     it('allows permitted path', () => {
-      assert.equal(checkAccess(DENY, 'delete-note', { path: 'inbox/todo.md' }), null);
+      assert.equal(checkAccess(DENY, 'delete-note', { folder: 'inbox', filename: 'todo.md' }), null);
     });
 
     it('reflects normalised path in message, not raw input', () => {
-      const r = checkAccess(DENY, 'delete-note', { path: '//people/alice.md' });
+      const r = checkAccess(DENY, 'delete-note', { folder: '//people', filename: 'alice.md' });
       assert.ok(r?.includes("'people/alice.md'"));
       assert.ok(!r?.includes('//'));
+    });
+
+    it('handles missing folder (filename only)', () => {
+      assert.equal(checkAccess(DENY, 'delete-note', { filename: 'inbox.md' }), null);
     });
   });
 
   describe('move-note', () => {
     it('blocks denied source', () => {
-      const r = checkAccess(DENY, 'move-note', { source: 'people/alice.md', destination: 'inbox/alice.md' });
+      const r = checkAccess(DENY, 'move-note', { folder: 'people', filename: 'alice.md', newFilename: 'alice.md' });
       assert.ok(r?.includes('source'));
     });
 
     it('blocks denied destination', () => {
-      const r = checkAccess(DENY, 'move-note', { source: 'inbox/alice.md', destination: 'people/alice.md' });
+      const r = checkAccess(DENY, 'move-note', { filename: 'alice.md', newFolder: 'people', newFilename: 'alice.md' });
       assert.ok(r?.includes('destination'));
     });
 
     it('allows permitted source and destination', () => {
-      assert.equal(checkAccess(DENY, 'move-note', { source: 'inbox/a.md', destination: 'projects/a.md' }), null);
+      assert.equal(checkAccess(DENY, 'move-note', { filename: 'a.md', newFolder: 'projects', newFilename: 'a.md' }), null);
+    });
+
+    it('allows when source has no folder (root-level file)', () => {
+      assert.equal(checkAccess(DENY, 'move-note', { filename: 'inbox.md', newFolder: 'projects', newFilename: 'inbox.md' }), null);
+    });
+
+    it('allows when destination has no folder (root-level destination)', () => {
+      assert.equal(checkAccess(DENY, 'move-note', { folder: 'projects', filename: 'a.md', newFilename: 'a.md' }), null);
     });
   });
 
@@ -175,12 +187,17 @@ describe('checkAccess', () => {
 
   describe('create-directory', () => {
     it('blocks denied path', () => {
-      const r = checkAccess(DENY, 'create-directory', { path: 'people/new' });
+      const r = checkAccess(DENY, 'create-directory', { folder: 'people/new' });
       assert.ok(r?.includes('restricted'));
     });
 
     it('allows permitted path', () => {
-      assert.equal(checkAccess(DENY, 'create-directory', { path: 'projects/new' }), null);
+      assert.equal(checkAccess(DENY, 'create-directory', { folder: 'projects/new' }), null);
+    });
+
+    it('blocks .. traversal into denied path', () => {
+      const r = checkAccess(DENY, 'create-directory', { folder: 'projects/../people/new' });
+      assert.ok(r?.includes('restricted'));
     });
   });
 

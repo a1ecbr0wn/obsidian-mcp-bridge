@@ -31,14 +31,14 @@ export function checkAccess(denyPaths, toolName, args) {
     }
 
     case 'delete-note': {
-      const p = normPath(args.path);
+      const p = normPath(args.folder, args.filename);
       if (isDenied(denyPaths, p)) return `Access denied: '${p}' is restricted`;
       break;
     }
 
     case 'move-note': {
-      const src = normPath(args.source);
-      const dst = normPath(args.destination);
+      const src = normPath(args.folder, args.filename);
+      const dst = normPath(args.newFolder, args.newFilename);
       if (isDenied(denyPaths, src)) return `Access denied: source '${src}' is restricted`;
       if (isDenied(denyPaths, dst)) return `Access denied: destination '${dst}' is restricted`;
       break;
@@ -53,7 +53,7 @@ export function checkAccess(denyPaths, toolName, args) {
     }
 
     case 'create-directory': {
-      const p = normPath(args.path);
+      const p = normPath(args.folder);
       if (isDenied(denyPaths, p)) return `Access denied: '${p}' is restricted`;
       break;
     }
